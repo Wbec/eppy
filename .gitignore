@@ -64,6 +64,7 @@ instance/
 .scrapy
 
 # Sphinx documentation
+docs/generated/
 docs/_build/
 
 # PyBuilder
@@ -90,3 +91,6 @@ ENV/
 
 # Rope project settings
 .ropeproject
+
+# intellij
+.idea
