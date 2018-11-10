@@ -16,8 +16,8 @@ import os
 import platform
 import pydoc
 import shutil
-from subprocess import CalledProcessError
-from subprocess import check_call
+from subprocess import CalledProcessError, check_call
+import sys
 import tempfile
 
 try:
@@ -138,14 +138,14 @@ def wrapped_help_text(wrapped_func):
     return decorator
 
 
-def runIDFs(jobs_list, processors=1):
+def runIDFs(jobs, processors=1):
     """Wrapper for run() to be used when running IDF5 runs in parallel.
 
     Parameters
     ----------
-    jobs_list : list
-        A list made up of an IDF5 object and a kwargs dict (see .
-
+    jobs : iterable
+        A list or generator made up of an IDF5 object and a kwargs dict
+        (see `run_functions.run` for valid keywords).
     processors : int, optional
         Number of processors to run on (default: 1). If 0 is passed then
         the process will run on all CPUs, -1 means one less than all CPUs, etc.
@@ -157,26 +157,32 @@ def runIDFs(jobs_list, processors=1):
     shutil.rmtree("multi_runs", ignore_errors=True)
     os.mkdir("multi_runs")
 
-    processed_runs = []
-    for i, item in enumerate(jobs_list):
-        idf = item[0]
-        epw = idf.epw
-        kwargs = item[1]
-        idf_dir = os.path.join('multi_runs', 'idf_%i' % i)
-        os.mkdir(idf_dir)
-        idf_path = os.path.join(idf_dir, 'in.idf')
-        idf.saveas(idf_path)
-        processed_runs.append([[idf_path, epw], kwargs])
-
+    prepared_runs = (prepare_run(run_id, run_data) for run_id, run_data in enumerate(jobs))
     try:
         pool = mp.Pool(processors)
-        pool.map(multirunner, processed_runs)
+        pool.map(multirunner, prepared_runs)
         pool.close()
     except NameError:
         # multiprocessing not present so pass the jobs one at a time
-        for job in processed_runs:
+        for job in prepared_runs:
             multirunner([job])
     shutil.rmtree("multi_runs", ignore_errors=True)
+
+
+def prepare_run(run_id, run_data):
+    """Prepare run inputs for one of multiple EnergyPlus runs.
+
+    :param run_id: An ID number for naming the IDF.
+    :param run_data: Tuple of the IDF and keyword args to pass to EnergyPlus executable.
+    :return: Tuple of the IDF path and EPW, and the keyword args.
+    """
+    idf, kwargs = run_data
+    epw = idf.epw
+    idf_dir = os.path.join('multi_runs', 'idf_%i' % run_id)
+    os.mkdir(idf_dir)
+    idf_path = os.path.join(idf_dir, 'in.idf')
+    idf.saveas(idf_path)
+    return (idf_path, epw), kwargs
 
 
 def multirunner(args):
@@ -267,6 +273,8 @@ def run(idf=None, weather=None, output_directory='', annual=False,
     verbose = args.pop('verbose')
     idf = args.pop('idf')
     iddname = args.get('idd')
+    if not isinstance(iddname, str):
+        args.pop('idd')
     try:
         idf_path = os.path.abspath(idf.idfname)
     except AttributeError:
@@ -293,7 +301,8 @@ def run(idf=None, weather=None, output_directory='', annual=False,
         args['weather'] = os.path.abspath(args['weather'])
     else:
         args['weather'] = os.path.join(eplus_weather_path, args['weather'])
-    args['output_directory'] = os.path.abspath(args['output_directory'])
+    output_dir = os.path.abspath(args['output_directory'])
+    args['output_directory'] = output_dir
 
     # store the directory we start in
     cwd = os.getcwd()
@@ -313,11 +322,35 @@ def run(idf=None, weather=None, output_directory='', annual=False,
 
     try:
         if verbose == 'v':
+            print("\r\n" + " ".join(cmd) + "\r\n")
             check_call(cmd)
         elif verbose == 'q':
             check_call(cmd, stdout=open(os.devnull, 'w'))
-        os.chdir(cwd)
     except CalledProcessError:
-        # potentially catch contents of std out and put it in the error
-        raise
+        message = parse_error(output_dir)
+        raise EnergyPlusRunError(message)
+    finally:
+        os.chdir(cwd)
     return 'OK'
+
+
+def parse_error(output_dir):
+    """Add contents of stderr and eplusout.err and put it in the exception message.
+
+    :param output_dir: str
+    :return: str
+    """
+    sys.stderr.seek(0)
+    std_err = sys.stderr.read().decode('utf-8')
+    err_file = os.path.join(output_dir, "eplusout.err")
+    if os.path.isfile(err_file):
+        with open(err_file, "r") as f:
+            ep_err = f.read()
+    else:
+        ep_err = "<File not found>"
+    message = "\r\n{std_err}\r\nContents of EnergyPlus error file at {err_file}\r\n{ep_err}".format(**locals())
+    return message
+
+
+class EnergyPlusRunError(Exception):
+    pass
